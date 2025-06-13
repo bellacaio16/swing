@@ -12,7 +12,7 @@ from SmartApi import SmartConnect, smartExceptions
 SYMBOL_TOKEN_FILE = 'symbol-token.txt'
 HISTORY_YEARS = 2
 ANALYSIS_DAYS = 60                # days to analyze
-OUTPUT_CSV = 'intraday_breakouts.csv'
+OUTPUT_CSV = 'breakouts.csv'
 CACHE_DIR = 'cache'
 HOURLY_INTERVAL = 'ONE_HOUR'
 DAILY_INTERVAL = 'ONE_DAY'
@@ -23,7 +23,7 @@ TENMIN_INTERVAL = 'TEN_MINUTE'
 MIN_LEVEL_AGE = 30                # days
 MIN_TOUCHES = 2
 VOL_MULTIPLIER = 1.5
-RSI_RANGE = {'bullish': (30, 75), 'bearish': (25, 65)}
+RSI_RANGE = {'bullish': (50, 75), 'bearish': (25, 40)}
 CONFIRMATION_CANDLES = 3          # Candles to confirm breakout
 
 # Technical parameters
@@ -159,6 +159,13 @@ def find_strong_levels(df, pivot_window=5):
     levels['sup'].sort(key=lambda x: x['level'], reverse=True)
     return levels
 
+def round_target(price):
+    if price < 100:
+        return round(price, 2)
+    elif price < 500:
+        return round(price, 1)
+    else:
+        return round(price)  # No decimals
 
 def analyze_stock(smart, symbol, token):
     logger.info(f"Analyzing {symbol}")
@@ -219,13 +226,25 @@ def analyze_stock(smart, symbol, token):
                     lvl = {'level': min(sup_lvls), 'score': None, 'age': None}
             if not action:
                 continue
-            bp = lvl['level']
+            bp = round_target(lvl['level'])
+
             sl_price = bp * (1 - SL_BUFFER) if action == 'BUY' else bp * (1 + SL_BUFFER)
             # targets from pivots
             piv_list = levels['res'] if action == 'BUY' else levels['sup']
             pts = [l['level'] for l in piv_list if (l['level'] > bp if action == 'BUY' else l['level'] < bp)]
-            t1 = pts[0] if len(pts) > 0 else bp * (1 + (TARGET1_PCT if action == 'BUY' else -TARGET1_PCT))
-            t2 = pts[1] if len(pts) > 1 else bp * (1 + (TARGET2_PCT if action == 'BUY' else -TARGET2_PCT))
+            t_1 = pts[0] if len(pts) > 0 else bp * (1 + (TARGET1_PCT if action == 'BUY' else -TARGET1_PCT))
+            t_2 = pts[1] if len(pts) > 1 else bp * (1 + (TARGET2_PCT if action == 'BUY' else -TARGET2_PCT))
+
+            if action=='BUY':
+                sorted_targets = sorted([bp * 1.06, t_1, t_2])
+                t1 = round_target(sorted_targets[0])
+                t2 = round_target(sorted_targets[1])
+                t3 = round_target(sorted_targets[2])
+            else:
+                sorted_targets = sorted([bp * (1-0.06), t_1, t_2], reverse=True)
+                t1 = round_target(sorted_targets[0])
+                t2 = round_target(sorted_targets[1])
+                t3 = round_target(sorted_targets[2])
 
             results.append({
                 'date': day.strftime('%Y-%m-%d'),
@@ -237,6 +256,7 @@ def analyze_stock(smart, symbol, token):
                 'stop_loss': sl_price,
                 'target1': t1,
                 'target2': t2,
+                'target3': t3,
                 'rsi': row['rsi'],
                 'macd': row['macd'],
                 'volume': row['volume'],
@@ -248,14 +268,13 @@ def analyze_stock(smart, symbol, token):
 
     return results
 
-
 def main():
     smart = init_smartapi()
     full_map = load_symbol_tokens(SYMBOL_TOKEN_FILE)
     all_results = []
     total = len(full_map)
     for i, (sym, tok) in enumerate(full_map.items(), 1):
-        if i > 120:
+        if i > 201:
             break
         logger.info(f"Processing {sym} ({i}/{total})")
         picks = analyze_stock(smart, sym, tok)
