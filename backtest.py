@@ -8,17 +8,17 @@ import pyotp
 from SmartApi import SmartConnect, smartExceptions
 
 # ======= CONFIGURATION ========
-BREAKOUT_CSV         = 'intraday_breakouts.csv'
-SWING_BACKTEST_CSV   = 'swing_backtest_results.csv'
-CACHE_DIR            = 'cache_daily'
-DAILY_INTERVAL       = 'ONE_DAY'
-MAX_HOLD_DAYS        = 10
-MAX_CAPITAL_PER_TRADE = 35000  # ₹35k max per trade
+BREAKOUT_CSV = 'breakouts.csv'
+SWING_BACKTEST_CSV = 'swing_backtest_results.csv'
+CACHE_DIR = 'cache_daily'
+DAILY_INTERVAL = 'ONE_DAY'
+MAX_HOLD_DAYS = 10
+MAX_CAPITAL_PER_TRADE = 15000  # ₹35k max per trade
 
 # SmartAPI credentials
-API_KEY     = '3ZkochvK'
-USERNAME    = 'D61366376'
-PASSWORD    = '2299'
+API_KEY = '3ZkochvK'
+USERNAME = 'D61366376'
+PASSWORD = '2299'
 TOTP_SECRET = 'B4C2S5V6DUWUP2E4SFVRWA5CGE'
 # ==============================
 
@@ -34,7 +34,6 @@ def init_smartapi():
     smart.generateToken(sess['data']['refreshToken'])
     return smart
 
-
 def fetch_daily_candles(smart, token, start_date, end_date):
     os.makedirs(CACHE_DIR, exist_ok=True)
     cache_file = os.path.join(CACHE_DIR, f"{token}_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.pkl")
@@ -49,6 +48,7 @@ def fetch_daily_candles(smart, token, start_date, end_date):
         'todate': end_date.strftime('%Y-%m-%d 23:59')
     }
     resp = smart.getCandleData(params)
+    time.sleep(0.2)
     if resp.get('data'):
         df = pd.DataFrame(resp['data'], columns=['timestamp','open','high','low','close','volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp']).dt.date
@@ -57,8 +57,8 @@ def fetch_daily_candles(smart, token, start_date, end_date):
         return df
     return pd.DataFrame()
 
-
-def swing_backtest_trade(smart, trade):
+def swing_backtest_trade(smart, trade, end_date=None):
+    """Backtests a trade with optional early exit date"""
     entry_date = datetime.datetime.strptime(trade['entry_date'], '%Y-%m-%d').date()
     token = trade['token']
     action = trade['action']
@@ -66,65 +66,162 @@ def swing_backtest_trade(smart, trade):
     sl = trade['stop_loss']
     t1 = trade['target1']
     t2 = trade['target2']
+    t3 = trade['target3']
 
-    position_size = int(MAX_CAPITAL_PER_TRADE // breakout) if breakout > 0 else 0
-    capital_used = position_size * breakout
-
-    start = entry_date + datetime.timedelta(days=1)
-    end = entry_date + datetime.timedelta(days=MAX_HOLD_DAYS)
-    df = fetch_daily_candles(smart, token, start, end)
-    if df.empty or position_size <= 0:
+    # Calculate position size
+    if breakout > 0:
+        position_size = int(MAX_CAPITAL_PER_TRADE // breakout)
+        capital_used = position_size * breakout
+    else:
         return None
 
+    # Determine simulation period
+    start = entry_date + datetime.timedelta(days=1)
+    if end_date:
+        end = end_date
+    else:
+        end = entry_date + datetime.timedelta(days=MAX_HOLD_DAYS)
+    
+    # Handle cases where end date is before start date
+    if end < start:
+        return {
+            **trade,
+            'position_size': position_size,
+            'capital_used': capital_used,
+            'exit_date': entry_date.strftime('%Y-%m-%d'),
+            'exit_price': breakout,
+            'result': 'SAME_DAY_EXIT',
+            'pnl_per_share': 0,
+            'pnl_total': 0,
+            'holding_days': 0
+        }
+
+    # Fetch price data
+    df = fetch_daily_candles(smart, token, start, end)
+    if df.empty:
+        return None
+
+    # Initialize state variables
     hit_t1 = False
+    hit_t2 = False
     exit_price = None
     exit_date = None
     result = None
 
+    # Main simulation loop
     for day, row in df.iterrows():
         high = row['high']
         low = row['low']
+        close = row['close']
+        
         if action == 'BUY':
+            # Check for stop loss hit
+            if low <= sl:
+                exit_price = sl
+                exit_date = day
+                result = 'SL'
+                break
+                
+            # Check for target hits
+            if not hit_t1 and high >= t1:
+                hit_t1 = True
+            if not hit_t2 and high >= t2:
+                hit_t2 = True
+                
+            # Handle exit conditions based on target hits
             if not hit_t1:
-                if low <= sl:
-                    exit_price, exit_date, result = sl, day, 'SL'
+                if high >= t3:
+                    exit_price = t3
+                    exit_date = day
+                    result = 'T3'
                     break
-                if high >= t1:
-                    hit_t1 = True
-                if high >= t2:
-                    exit_price, exit_date, result = t2, day, 'T2'
+                elif high >= t2:
+                    exit_price = t2
+                    exit_date = day
+                    result = 'T2'
                     break
-            else:
-                if low <= breakout:
-                    exit_price, exit_date, result = breakout, day, 'T1_SL'
+            elif hit_t1 and not hit_t2:
+                if low <= breakout:  # Trail SL to breakout
+                    exit_price = breakout
+                    exit_date = day
+                    result = 'T1_SL'
                     break
-                if high >= t2:
-                    exit_price, exit_date, result = t2, day, 'T2'
+                if high >= t3:
+                    exit_price = t3
+                    exit_date = day
+                    result = 'T3'
                     break
-        else:
+            else:  # Both T1 and T2 hit
+                if low <= t1:  # Trail SL to T1
+                    exit_price = t1
+                    exit_date = day
+                    result = 'T2_SL'
+                    break
+                if high >= t3:
+                    exit_price = t3
+                    exit_date = day
+                    result = 'T3'
+                    break
+                    
+        else:  # SELL action
+            # Check for stop loss hit
+            if high >= sl:
+                exit_price = sl
+                exit_date = day
+                result = 'SL'
+                break
+                
+            # Check for target hits
+            if not hit_t1 and low <= t1:
+                hit_t1 = True
+            if not hit_t2 and low <= t2:
+                hit_t2 = True
+                
+            # Handle exit conditions based on target hits
             if not hit_t1:
-                if high >= sl:
-                    exit_price, exit_date, result = sl, day, 'SL'
+                if low <= t3:
+                    exit_price = t3
+                    exit_date = day
+                    result = 'T3'
                     break
-                if low <= t1:
-                    hit_t1 = True
-                if low <= t2:
-                    exit_price, exit_date, result = t2, day, 'T2'
+                elif low <= t2:
+                    exit_price = t2
+                    exit_date = day
+                    result = 'T2'
                     break
-            else:
-                if high >= breakout:
-                    exit_price, exit_date, result = breakout, day, 'T1_SL'
+            elif hit_t1 and not hit_t2:
+                if high >= breakout:  # Trail SL to breakout
+                    exit_price = breakout
+                    exit_date = day
+                    result = 'T1_SL'
                     break
-                if low <= t2:
-                    exit_price, exit_date, result = t2, day, 'T2'
+                if low <= t3:
+                    exit_price = t3
+                    exit_date = day
+                    result = 'T3'
                     break
-    else:
+            else:  # Both T1 and T2 hit
+                if high >= t1:  # Trail SL to T1
+                    exit_price = t1
+                    exit_date = day
+                    result = 'T2_SL'
+                    break
+                if low <= t3:
+                    exit_price = t3
+                    exit_date = day
+                    result = 'T3'
+                    break
+    
+    # Handle positions that weren't exited by conditions
+    if exit_price is None:
         exit_date = df.index[-1]
         exit_price = df['close'].iloc[-1]
         result = 'MKT'
 
+    # Calculate P&L and holding period
     pnl_per_share = (exit_price - breakout) if action == 'BUY' else (breakout - exit_price)
     pnl_total = pnl_per_share * position_size
+    holding_days = (exit_date - entry_date).days
 
     return {
         **trade,
@@ -135,17 +232,16 @@ def swing_backtest_trade(smart, trade):
         'result': result,
         'pnl_per_share': pnl_per_share,
         'pnl_total': pnl_total,
-        'holding_days': (exit_date - start + datetime.timedelta(days=1)).days
+        'holding_days': holding_days
     }
-
 
 def main():
     smart = init_smartapi()
     trades_df = pd.read_csv(BREAKOUT_CSV, dtype={'date': str, 'token': str, 'action': str})
 
+    # Preprocess data
     if 'time' not in trades_df.columns:
-        trades_df['time'] = '09:15:00'  # default if missing
-
+        trades_df['time'] = '09:15:00'
     trades_df['datetime'] = pd.to_datetime(trades_df['date'] + ' ' + trades_df['time'])
     trades_df = trades_df.sort_values(by='datetime')
 
@@ -166,42 +262,63 @@ def main():
             'stop_loss': row['stop_loss'],
             'target1': row['target1'],
             'target2': row['target2'],
+            'target3': row['target3'],
             'entry_date': row['date']
         }
 
+        # Handle existing positions
         if symbol in ongoing_positions:
             held = ongoing_positions[symbol]
             held_entry = datetime.datetime.strptime(held['entry_date'], '%Y-%m-%d').date()
-            if current_date <= held_entry + datetime.timedelta(days=MAX_HOLD_DAYS):
-                # Still holding → update SL/targets
+            
+            # Check if still within max hold period and same action
+            if (current_date <= held_entry + datetime.timedelta(days=MAX_HOLD_DAYS)) and (action == held['action']):
+                # Update existing position - same action
                 if action == 'BUY':
-                    held['target1'] = max(held['target1'], new_trade['target1'])
-                    held['target2'] = max(held['target2'], new_trade['target2'])
-                    held['stop_loss'] = min(held['stop_loss'], new_trade['stop_loss'])
-                elif action == 'SELL':
-                    held['target1'] = min(held['target1'], new_trade['target1'])
-                    held['target2'] = min(held['target2'], new_trade['target2'])
+                    # For BUY: sort targets ascending, take highest SL
+                    targets = sorted([held['target1'], new_trade['target1'], 
+                                     held['target2'], new_trade['target2'], 
+                                     held['target3'], new_trade['target3']])
+                    held['target1'] = new_trade['target1']
+                    held['target2'] = new_trade['target2']
+                    held['target3'] = new_trade['target3']
                     held['stop_loss'] = max(held['stop_loss'], new_trade['stop_loss'])
+                else:  # SELL
+                    # For SELL: sort targets ascending, take lowest SL
+                    targets = sorted([held['target1'], new_trade['target1'], 
+                                     held['target2'], new_trade['target2'], 
+                                     held['target3'], new_trade['target3']])
+                    held['target1'] = new_trade['target1']
+                    held['target2'] = new_trade['target2']
+                    held['target3'] = new_trade['target3']
+                    held['stop_loss'] = min(held['stop_loss'], new_trade['stop_loss'])
+                
+                # Keep the position with updated parameters
+                ongoing_positions[symbol] = held
                 continue
             else:
-                # Exit and replace
-                res = swing_backtest_trade(smart, held)
+                # Exit existing position (opposite action or beyond max hold days)
+                # Use current date as early exit date
+                res = swing_backtest_trade(smart, held, end_date=current_date)
                 if res:
                     results.append(res)
                 del ongoing_positions[symbol]
-
-
+        
+        # Add new trade to positions
         ongoing_positions[symbol] = new_trade
-        time.sleep(0.1)
+        time.sleep(0.1)  # Rate limit protection
 
-    # Final flush of all held positions
+    # Process any remaining positions
     for sym, trade in ongoing_positions.items():
         res = swing_backtest_trade(smart, trade)
         if res:
             results.append(res)
 
-    pd.DataFrame(results).to_csv(SWING_BACKTEST_CSV, index=False)
-
+    # Save results
+    if results:
+        pd.DataFrame(results).to_csv(SWING_BACKTEST_CSV, index=False)
+    else:
+        logger.warning("No backtest results to save")
 
 if __name__ == '__main__':
     main()
