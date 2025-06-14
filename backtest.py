@@ -162,25 +162,6 @@ def swing_backtest_trade(smart, trade, end_date=None):
                     exit_price, exit_date, result = t1, day, 'T2_SL'; break
                 if high >= t3:
                     exit_price, exit_date, result = t3, day, 'T3'; break
-        else:  # SELL
-            if not hit_t1:
-                if high >= sl:
-                    exit_price, exit_date, result = sl, day, 'SL'; break
-                if low <= t1: hit_t1 = True
-                if low <= t2: hit_t2 = True
-                if low <= t3:
-                    exit_price, exit_date, result = t3, day, 'T3'; break
-            elif hit_t1 and not hit_t2:
-                if high >= breakout:
-                    exit_price, exit_date, result = breakout, day, 'T1_SL'; break
-                if low <= t2: hit_t2 = True
-                if low <= t3:
-                    exit_price, exit_date, result = t3, day, 'T3'; break
-            else:
-                if high >= t1:
-                    exit_price, exit_date, result = t1, day, 'T2_SL'; break
-                if low <= t3:
-                    exit_price, exit_date, result = t3, day, 'T3'; break
 
     if exit_price is None:
         exit_date = df.index[-1]
@@ -240,18 +221,15 @@ def main():
             'target3': float(row['target3']),
             'entry_date': current_date
         }
-        logger.info(f"{token} {action} -> Found -> index {i}")
+        logger.info(f"{token} {action} -> Found ")
 
         # Update existing positions
         if symbol in ongoing_positions:
             held = ongoing_positions[symbol]
             held_entry = held['entry_date']
-            if (current_date <= held_entry + timedelta(days=MAX_HOLD_DAYS)) and (action == held['action']):
+            if (current_date <= held_entry + timedelta(days=MAX_HOLD_DAYS)):
                 # merge signals
-                if action == 'BUY':
-                    held['stop_loss'] = max(held['stop_loss'], new_trade['stop_loss'])
-                else:
-                    held['stop_loss'] = min(held['stop_loss'], new_trade['stop_loss'])
+                held['stop_loss'] = max(held['stop_loss'], new_trade['stop_loss'])
                 held.update({ 'target1': new_trade['target1'],
                               'target2': new_trade['target2'],
                               'target3': new_trade['target3'] })
