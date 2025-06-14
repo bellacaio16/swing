@@ -23,7 +23,7 @@ TENMIN_INTERVAL = 'TEN_MINUTE'
 MIN_LEVEL_AGE = 30                # days
 MIN_TOUCHES = 2
 VOL_MULTIPLIER = 1.5
-RSI_RANGE = {'bullish': (50, 75), 'bearish': (25, 40)}
+RSI_RANGE = {'bullish': (55, 75), 'bearish': (25, 40)}
 CONFIRMATION_CANDLES = 3          # Candles to confirm breakout
 
 # Technical parameters
@@ -282,6 +282,8 @@ def main():
         time.sleep(0.1)
 
     df = pd.DataFrame(all_results)
+    # only keep BUY trades
+    df = df[df['action'] == 'BUY']
     # ensure date/time are proper types for sorting
     df['date'] = pd.to_datetime(df['date'])
     df['time'] = pd.to_datetime(df['time'], format='%H:%M').dt.time
