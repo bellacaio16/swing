@@ -13,8 +13,8 @@ BREAKOUT_CSV = 'breakouts.csv'
 SWING_BACKTEST_CSV = 'swing_backtest_results.csv'
 CACHE_DIR = 'cache_daily'
 DAILY_INTERVAL = 'ONE_DAY'
-MAX_HOLD_DAYS = 10
-MAX_CAPITAL_PER_TRADE = 10000  # ₹10k max per trade
+MAX_HOLD_DAYS = 9   # 10 days--------xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+MAX_CAPITAL_PER_TRADE = 7000  # ₹7k max per trade-----xxxxxxxxxxxxxxxxxxxx
 
 # SmartAPI credentials
 API_KEY = '3ZkochvK'
@@ -133,7 +133,7 @@ def swing_backtest_trade(smart, trade, end_date=None):
             'pnl_total': 0,
             'holding_days': 0
         }
-
+    print(f"{token} ---> EXIT <---")
     df = fetch_daily_candles(smart, token, start, end)
     if df.empty:
         return None
@@ -143,32 +143,31 @@ def swing_backtest_trade(smart, trade, end_date=None):
 
     for day, row in df.iterrows():
         high, low = row['high'], row['low']
-        if action == 'BUY':
-            if not hit_t1:
-                if low <= sl:
-                    exit_price, exit_date, result = sl, day, 'SL'; break
-                if high >= t1: hit_t1 = True
-                if high >= t2: hit_t2 = True
-                if high >= t3:
-                    exit_price, exit_date, result = t3, day, 'T3'; break
-            elif hit_t1 and not hit_t2:
-                if low <= breakout:
-                    exit_price, exit_date, result = breakout, day, 'T1_SL'; break
-                if high >= t2: hit_t2 = True
-                if high >= t3:
-                    exit_price, exit_date, result = t3, day, 'T3'; break
-            else:  # hit_t1 and hit_t2
-                if low <= t1:
-                    exit_price, exit_date, result = t1, day, 'T2_SL'; break
-                if high >= t3:
-                    exit_price, exit_date, result = t3, day, 'T3'; break
+        if not hit_t1:
+            if low <= sl:
+                exit_price, exit_date, result = sl, day, 'SL'; break
+            if high >= t1: hit_t1 = True
+            if high >= t2: hit_t2 = True
+            if high >= t3:
+                exit_price, exit_date, result = t3, day, 'T3'; break
+        elif hit_t1 and not hit_t2:
+            if low <= breakout:
+                exit_price, exit_date, result = breakout, day, 'T1_SL'; break
+            if high >= t2: hit_t2 = True
+            if high >= t3:
+                exit_price, exit_date, result = t3, day, 'T3'; break
+        else:  # hit_t1 and hit_t2
+            if low <= t1:
+                exit_price, exit_date, result = t1, day, 'T2_SL'; break
+            if high >= t3:
+                exit_price, exit_date, result = t3, day, 'T3'; break
 
     if exit_price is None:
         exit_date = df.index[-1]
         exit_price = df['close'].iloc[-1]
         result = 'MKT'
 
-    pnl_per_share = (exit_price - breakout) if action == 'BUY' else (breakout - exit_price)
+    pnl_per_share = (exit_price - breakout)
     pnl_total = pnl_per_share * position_size
     holding_days = (exit_date - entry_date).days
 
@@ -219,21 +218,21 @@ def main():
             'target1': float(row['target1']),
             'target2': float(row['target2']),
             'target3': float(row['target3']),
-            'entry_date': current_date
+            'entry_date': current_date,
         }
-        logger.info(f"{token} {action} -> Found ")
+        logger.info(f"{token}-------------->> {action} ")
 
         # Update existing positions
         if symbol in ongoing_positions:
             held = ongoing_positions[symbol]
             held_entry = held['entry_date']
+            
             if (current_date <= held_entry + timedelta(days=MAX_HOLD_DAYS)):
                 # merge signals
-                held['stop_loss'] = max(held['stop_loss'], new_trade['stop_loss'])
-                held.update({ 'target1': new_trade['target1'],
-                              'target2': new_trade['target2'],
-                              'target3': new_trade['target3'] })
-                continue
+                res = swing_backtest_trade(smart, held, end_date=current_date )
+                if res:
+                    results.append(res)
+                del ongoing_positions[symbol]
             else:
                 # exit existing
                 res = swing_backtest_trade(smart, held)
