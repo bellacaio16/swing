@@ -13,19 +13,19 @@ BREAKOUT_CSV = 'breakouts.csv'
 SWING_BACKTEST_CSV = 'swing_backtest_results.csv'
 CACHE_DIR = 'cache_daily'
 DAILY_INTERVAL = 'ONE_DAY'
-MAX_HOLD_DAYS = 9   # 10 days--------xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-MAX_CAPITAL_PER_TRADE = 7000  # ₹7k max per trade-----xxxxxxxxxxxxxxxxxxxx
-
+MAX_HOLD_DAYS = 7   # Max trading days to hold
+MAX_CAPITAL_PER_TRADE = 6500  # ₹7k max per trade
+TOTAL_CAPITAL_START = 200000  # ₹2,00,000 initial capital
 # SmartAPI credentials
-API_KEY = '3ZkochvK'
+API_KEY = '4QWgqJPV'
 USERNAME = 'D61366376'
 PASSWORD = '2299'
 TOTP_SECRET = 'B4C2S5V6DUWUP2E4SFVRWA5CGE'
 # ==============================
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
 
 def init_smartapi():
     smart = SmartConnect(API_KEY)
@@ -36,7 +36,6 @@ def init_smartapi():
     smart.generateToken(sess['data']['refreshToken'])
     return smart
 
-
 def fetch_daily_candles(smart, token, start_date, end_date):
     os.makedirs(CACHE_DIR, exist_ok=True)
     cache_file = os.path.join(
@@ -46,22 +45,21 @@ def fetch_daily_candles(smart, token, start_date, end_date):
     if os.path.exists(cache_file):
         return pd.read_pickle(cache_file)
 
-    span_days = (end_date - start_date).days
-    if span_days > 30:
+    span = (end_date - start_date).days
+    if span > 30:
         parts = []
-        chunk_start = start_date
-        while chunk_start <= end_date:
-            chunk_end = min(chunk_start + timedelta(days=30), end_date)
-            part_df = fetch_daily_candles(smart, token, chunk_start, chunk_end)
-            if not part_df.empty:
-                parts.append(part_df)
-            chunk_start = chunk_end + timedelta(days=1)
+        d = start_date
+        while d <= end_date:
+            chunk_end = min(d + timedelta(days=30), end_date)
+            part = fetch_daily_candles(smart, token, d, chunk_end)
+            if not part.empty:
+                parts.append(part)
+            d = chunk_end + timedelta(days=1)
         if parts:
             df = pd.concat(parts).sort_index()
             df.to_pickle(cache_file)
             return df
-        else:
-            return pd.DataFrame()
+        return pd.DataFrame()
 
     params = {
         'exchange': 'NSE',
@@ -70,191 +68,170 @@ def fetch_daily_candles(smart, token, start_date, end_date):
         'fromdate': start_date.strftime('%Y-%m-%d 00:00'),
         'todate':   end_date.strftime('%Y-%m-%d 23:59')
     }
-    max_retries = 3
-    for attempt in range(1, max_retries + 1):
+    for attempt in range(3):
         try:
             resp = smart.getCandleData(params)
+            print("fetched")
             break
         except Exception as e:
-            logger.warning(f"Timeout on getCandleData (attempt {attempt}): {e}")
-            if attempt == max_retries:
-                logger.error(f"All retries failed for {token} {start_date}–{end_date}")
-                return pd.DataFrame()
-            time.sleep(2 ** attempt * 0.5)
-
-    if resp.get('data'):
-        df = pd.DataFrame(resp['data'],
-                          columns=['timestamp','open','high','low','close','volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp']).dt.date
-        df.set_index('timestamp', inplace=True)
-        df.to_pickle(cache_file)
-        return df
-
-    return pd.DataFrame()
-
-
-def swing_backtest_trade(smart, trade, end_date=None):
-    # entry_date is already a datetime.date
-    entry_date = trade['entry_date']
-    token = trade['token']
-    action = trade['action']
-    breakout = trade['breakout_level']
-    sl = trade['stop_loss']
-    t1 = trade['target1']
-    t2 = trade['target2']
-    t3 = trade['target3']
-
-    # Calculate position size
-    if breakout > 0:
-        position_size = int(MAX_CAPITAL_PER_TRADE // breakout)
-        capital_used = position_size * breakout
+            logger.warning(f" Atempt = {attempt+1}   {token} fetch error: {e}")
+            time.sleep(0.5 * 2 ** attempt)
     else:
-        return None
+        return pd.DataFrame()
 
-    # Simulation period
-    start = entry_date + timedelta(days=1)
-    if end_date:
-        end = end_date
-    else:
-        end = entry_date + timedelta(days=MAX_HOLD_DAYS)
+    data = resp.get('data') or []
+    if not data:
+        return pd.DataFrame()
 
-    if end < start:
-        return {
-            'symbol': trade['symbol'],
-            'token': token,
-            'action': action,
-            'entry_date': entry_date.strftime('%Y-%m-%d'),
-            'position_size': position_size,
-            'capital_used': capital_used,
-            'exit_date': entry_date.strftime('%Y-%m-%d'),
-            'exit_price': breakout,
-            'result': 'SAME_DAY_EXIT',
-            'pnl_per_share': 0,
-            'pnl_total': 0,
-            'holding_days': 0
-        }
-    print(f"{token} ---> EXIT <---")
-    df = fetch_daily_candles(smart, token, start, end)
-    if df.empty:
-        return None
-
-    hit_t1 = hit_t2 = False
-    exit_price = exit_date = result = None
-
-    for day, row in df.iterrows():
-        high, low = row['high'], row['low']
-        if not hit_t1:
-            if low <= sl:
-                exit_price, exit_date, result = sl, day, 'SL'; break
-            if high >= t1: hit_t1 = True
-            if high >= t2: hit_t2 = True
-            if high >= t3:
-                exit_price, exit_date, result = t3, day, 'T3'; break
-        elif hit_t1 and not hit_t2:
-            if low <= breakout:
-                exit_price, exit_date, result = breakout, day, 'T1_SL'; break
-            if high >= t2: hit_t2 = True
-            if high >= t3:
-                exit_price, exit_date, result = t3, day, 'T3'; break
-        else:  # hit_t1 and hit_t2
-            if low <= t1:
-                exit_price, exit_date, result = t1, day, 'T2_SL'; break
-            if high >= t3:
-                exit_price, exit_date, result = t3, day, 'T3'; break
-
-    if exit_price is None:
-        exit_date = df.index[-1]
-        exit_price = df['close'].iloc[-1]
-        result = 'MKT'
-
-    pnl_per_share = (exit_price - breakout)
-    pnl_total = pnl_per_share * position_size
-    holding_days = (exit_date - entry_date).days
-
-    return {
-        'symbol': trade['symbol'],
-        'token': token,
-        'action': action,
-        'entry_date': entry_date.strftime('%Y-%m-%d'),
-        'position_size': position_size,
-        'capital_used': capital_used,
-        'exit_date': exit_date.strftime('%Y-%m-%d'),
-        'exit_price': exit_price,
-        'result': result,
-        'pnl_per_share': pnl_per_share,
-        'pnl_total': pnl_total,
-        'holding_days': holding_days
-    }
-
+    df = pd.DataFrame(data, columns=['timestamp','open','high','low','close','volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp']).dt.date
+    df.set_index('timestamp', inplace=True)
+    df.to_pickle(cache_file)
+    return df
 
 def main():
     smart = init_smartapi()
-    trades_df = pd.read_csv(BREAKOUT_CSV, dtype=str)
+    df = pd.read_csv(BREAKOUT_CSV, dtype=str)
+    df['time']   = df.get('time',  '09:15:00')
+    df['date']   = pd.to_datetime(df['date'], dayfirst=True).dt.date
+    df['datetime'] = pd.to_datetime(df['date'].astype(str) + ' ' + df['time'])
+    df = df.sort_values('datetime')
+    trades_by_date = df.groupby('date')
 
-    # Ensure we have a time column
-    if 'time' not in trades_df.columns:
-        trades_df['time'] = '09:15:00'
-
-    # Parse date strings (day-first) into date objects
-    trades_df['date'] = pd.to_datetime(trades_df['date'], dayfirst=True).dt.date
-    trades_df['datetime'] = pd.to_datetime(trades_df['date'].astype(str) + ' ' + trades_df['time'])
-    trades_df = trades_df.sort_values(by='datetime')
-
+    start_date = df['date'].min()
+    last_signal = df['date'].max()
+    total_capital = TOTAL_CAPITAL_START
+    ongoing = {}      # symbol -> position dict
     results = []
-    ongoing_positions = {}
 
-    for i, row in trades_df.iterrows():
-        symbol = row['symbol']
-        token = row['token']
-        action = row['action']
-        current_date = row['date']
+    # 1. Loop from first through last signal date
+    current = start_date
+    while current <= last_signal:
+        # (a) Update existing positions
+        for sym in list(ongoing):
+            pos = ongoing[sym]
+            day_df = fetch_daily_candles(smart, pos['token'], current, current)
+            if day_df.empty:
+                continue  # non-trading day
 
-        new_trade = {
-            'symbol': symbol,
-            'token': token,
-            'action': action,
-            'breakout_level': float(row['breakout_level']),
-            'stop_loss': float(row['stop_loss']),
-            'target1': float(row['target1']),
-            'target2': float(row['target2']),
-            'target3': float(row['target3']),
-            'entry_date': current_date,
-        }
-        logger.info(f"{token}-------------->> {action} ")
+            high, low, close = day_df['high'].iloc[0], day_df['low'].iloc[0], day_df['close'].iloc[0]
+            pos['days_held'] += 1
 
-        # Update existing positions
-        if symbol in ongoing_positions:
-            held = ongoing_positions[symbol]
-            held_entry = held['entry_date']
-            
-            if (current_date <= held_entry + timedelta(days=MAX_HOLD_DAYS)):
-                # merge signals
-                res = swing_backtest_trade(smart, held, end_date=current_date )
-                if res:
-                    results.append(res)
-                del ongoing_positions[symbol]
-            else:
-                # exit existing
-                res = swing_backtest_trade(smart, held)
-                if res:
-                    results.append(res)
-                del ongoing_positions[symbol]
+            # flag profit targets
+            if not pos['hit1'] and high >= pos['targets'][0]:
+                pos['hit1'] = True
+            if not pos['hit2'] and high >= pos['targets'][1]:
+                pos['hit2'] = True
 
-        # open new position
-        ongoing_positions[symbol] = new_trade
-        time.sleep(0.1)
+            exit_flag = False
+            # check exits in proper order
+            if not pos['hit1'] and low <= pos['sl']:
+                price, reason = pos['sl'], 'SL'; exit_flag = True
+            elif pos['hit1'] and not pos['hit2'] and low <= pos['breakout']:
+                price, reason = pos['breakout'], 'T1_SL'; exit_flag = True
+            elif pos['hit2'] and low <= pos['targets'][0]:
+                price, reason = pos['targets'][0], 'T2_SL'; exit_flag = True
+            elif high >= pos['targets'][2]:
+                price, reason = pos['targets'][2], 'T3'; exit_flag = True
+            elif pos['days_held'] > MAX_HOLD_DAYS:
+                price, reason = close, 'MKT'; exit_flag = True
 
-    # close remaining positions
-    for trade in ongoing_positions.values():
-        res = swing_backtest_trade(smart, trade)
-        if res:
-            results.append(res)
+            if exit_flag:
+                pnl = (price - pos['breakout']) * pos['size']
+                total_capital += pos['capital'] + pnl
+                results.append({
+                    **pos,
+                    'exit_date':     current.strftime('%Y-%m-%d'),
+                    'exit_price':    price,
+                    'result':        reason,
+                    'pnl_total':     pnl,
+                    'remaining_capital': total_capital
+                })
+                print("EXIT")
+                del ongoing[sym]
 
+        # (b) Open or replace trades for today
+        if current in trades_by_date.groups:
+            for _, row in trades_by_date.get_group(current).iterrows():
+                sym      = row['symbol']
+                breakout = float(row['breakout_level'])
+                size     = int(MAX_CAPITAL_PER_TRADE / breakout)
+
+                # skip zero-size
+                if size < 1:
+                    logger.info(f"Skipping {sym}: breakout too high for minimum size")
+                    continue
+
+                cap_used = size * breakout
+
+                # replace if already holding
+                if sym in ongoing:
+                    pos = ongoing.pop(sym)
+                    day_df = fetch_daily_candles(smart, pos['token'], current, current)
+                    if not day_df.empty:
+                        open_price = day_df['open'].iloc[0]
+                        pnl = (open_price - pos['breakout']) * pos['size']
+                        total_capital += pos['capital'] + pnl
+                        results.append({
+                            **pos,
+                            'exit_date':     current.strftime('%Y-%m-%d'),
+                            'exit_price':    open_price,
+                            'result':        'REPLACE',
+                            'pnl_total':     pnl,
+                            'remaining_capital': total_capital
+                        })
+
+                # then new entry if capital allows
+                if total_capital >= cap_used:
+                    total_capital -= cap_used
+                    ongoing[sym] = {
+                        'symbol':       sym,
+                        'entry_date':   current.strftime('%Y-%m-%d'),
+                        'breakout':     breakout,
+                        'sl':           float(row['stop_loss']),
+                        'targets':      (
+                                           float(row['target1']),
+                                           float(row['target2']),
+                                           float(row['target3'])
+                                       ),
+                        'token':        row['token'],
+                        'size':         size,
+                        'capital':      cap_used,
+                        'hit1':         False,
+                        'hit2':         False,
+                        'days_held':    0
+                    }
+                else:
+                    logger.info(
+                        f"SKIPPED for {sym} on {current}: need {cap_used}, have {total_capital}"
+                    )
+
+        current += timedelta(days=1)
+
+    # 2. Exit any remaining positions on the last signal date
+    for sym, pos in list(ongoing.items()):
+        day_df = fetch_daily_candles(smart, pos['token'], last_signal, last_signal)
+        if not day_df.empty:
+            close_price = day_df['close'].iloc[0]
+        else:
+            close_price = pos['breakout']  # fallback
+        pnl = (close_price - pos['breakout']) * pos['size']
+        total_capital += pos['capital'] + pnl
+        results.append({
+            **pos,
+            'exit_date':        last_signal.strftime('%Y-%m-%d'),
+            'exit_price':       close_price,
+            'result':           'END',
+            'pnl_total':        pnl,
+            'remaining_capital': total_capital
+        })
+    ongoing.clear()
+
+    # Write out results
     if results:
         pd.DataFrame(results).to_csv(SWING_BACKTEST_CSV, index=False)
     else:
         logger.warning("No backtest results to save")
-
 
 if __name__ == '__main__':
     main()
