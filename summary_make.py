@@ -80,5 +80,39 @@ def main():
     print(f"✅ Summary written to: {SUMMARY_DAILY}")
     print(f"📊 Meta summary written to: {META_SUMMARY}")
 
+    
+    # Load your CSV file
+    df = pd.read_csv("swing_backtest_results.csv", parse_dates=["entry_date"])
+    
+    # Clean and normalize result column (optional)
+    df['result'] = df['result'].str.strip()
+    
+    # Extract year-month for grouping
+    df['month'] = df['entry_date'].dt.to_period('M')
+    
+    # Group by month
+    summary = df.groupby('month').apply(lambda x: pd.Series({
+        'Total_Trades': len(x),
+        'SL_Hits': (x['result'] == 'SL').sum(),
+        'Target_Hit1_or_2': ((x['hit1'] == True) | (x['hit2'] == True)).sum(),
+        'QUALITY_EXIT': (x['result'] == 'QUALITY_EXIT').sum(),
+        'REPLACE': (x['result'] == 'REPLACE').sum(),
+        'FORCE_EXIT': (x['result'] == 'FORCE_EXIT').sum(),
+        'Monthly_PnL': x['pnl_total'].sum(),
+        'Capital_Used': x['capital'].sum(),
+        'ROI_%': (x['pnl_total'].sum() / x['capital'].sum()) * 100 if x['capital'].sum() != 0 else 0
+    })).reset_index()
+    
+    # Optional: Round values
+    summary['Monthly_PnL'] = summary['Monthly_PnL'].round(2)
+    summary['ROI_%'] = summary['ROI_%'].round(2)
+    
+    # Print summary
+    print(summary)
+    
+    # Save to CSV if needed
+    summary.to_csv("monthly_backtest_summary.csv", index=False)
+
+
 if __name__ == '__main__':
     main()
