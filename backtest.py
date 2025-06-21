@@ -5,303 +5,530 @@ import numpy as np
 from datetime import timedelta
 import time
 import logging
-import pyotp
-from SmartApi import SmartConnect, smartExceptions
+import requests
+from pandas.tseries.offsets import BDay
 
 # ======= CONFIGURATION ========
 BREAKOUT_CSV = 'breakouts.csv'
-SWING_BACKTEST_CSV = 'swing_backtest_results.csv'
-CACHE_DIR = 'cache_daily'
-DAILY_INTERVAL = 'ONE_DAY'
-MAX_HOLD_DAYS = 7               # Max trading days to hold
-FORCE_EXIT_DAYS = 3             # Force exit if no target hit within this many days
-RISK_PER_TRADE_PCT = 0.035      # 3.5% of capital per trade
-MAX_CAPITAL_PER_TRADE = 35000   # Hard cap per trade
-ATR_PERIOD = 14                 # ATR lookback period
-ATR_MULTIPLIER = 1.5            # For trailing stop calculation
-CACHE_MAX_AGE_DAYS = 7          # Invalidate cached files older than this
-TOTAL_CAPITAL_START = 200000    # ₹2,00,000 initial capital
-# SmartAPI credentials
-API_KEY = '4QWgqJPV'
-USERNAME = 'D61366376'
-PASSWORD = '2299'
-TOTP_SECRET = 'B4C2S5V6DUWUP2E4SFVRWA5CGE'
+SWING_BACKTEST_CSV = 'backtest_results.csv'
+SYMBOLS_CSV = 'symbols_data.csv'
+CACHE_DIR = 'cache_10min'
+INTRADAY_UNIT = 'minutes'
+INTRADAY_INTERVAL = 10
+MAX_HOLD_DAYS = 8
+FORCE_EXIT_DAYS = 6
+MAX_CAPITAL_PER_TRADE = 35000
+RISK_PER_TRADE_PCT = 0.030
+ATR_PERIOD = 14
+CACHE_MAX_AGE_DAYS = 7
+TOTAL_CAPITAL_START = 200000
+MARKET_START_TIME = datetime.time(9, 15)
+MARKET_END_TIME = datetime.time(15, 30)
+MAX_DATA_STALENESS_MINUTES = 15
 # ==============================
 
 logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+                   format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Market holidays (add dates as needed)
+MARKET_HOLIDAYS = [
+    datetime.date(2023, 1, 26),
+    datetime.date(2023, 3, 7),
+    datetime.date(2023, 3, 30),
+    datetime.date(2023, 4, 4),
+    datetime.date(2023, 4, 7),
+    datetime.date(2023, 4, 14),
+    datetime.date(2023, 5, 1),
+    datetime.date(2023, 6, 28),
+    datetime.date(2023, 8, 15),
+    datetime.date(2023, 9, 19),
+    datetime.date(2023, 10, 2),
+    datetime.date(2023, 10, 24),
+    datetime.date(2023, 11, 14),
+    datetime.date(2023, 11, 27),
+    datetime.date(2023, 12, 25)
+]
 
-def init_smartapi():
-    smart = SmartConnect(API_KEY)
-    totp = pyotp.TOTP(TOTP_SECRET).now()
-    sess = smart.generateSession(USERNAME, PASSWORD, totp)
-    if not sess.get('status'):
-        raise RuntimeError('SmartAPI login failed')
-    smart.generateToken(sess['data']['refreshToken'])
-    return smart
+# Replace the MARKET_HOLIDAYS list and is_market_open function with this:
 
-# Calculate total charges for CNC delivery trades
+def is_market_open(date, instrument_key=None, cached_data=None):
+    """Check if market is open on given date"""
+    # Convert to date object if it's datetime
+    if isinstance(date, datetime.datetime):
+        date = date.date()
+    
+    # Always closed on weekends
+    if date.weekday() >= 5:
+        return False
+        
+    # Check manual holiday list (optional)
+    MARKET_HOLIDAYS = []  # Empty by default, add dates if needed
+    
+    if date in MARKET_HOLIDAYS:
+        return False
+        
+    # If instrument data is provided, verify we have data for this date
+    if instrument_key and cached_data:
+        date_str = date.strftime('%Y-%m-%d')
+        df_day = cached_data[cached_data.index.date == date]
+        if df_day.empty:
+            logger.info(f"No data available for {instrument_key} on {date_str} - treating as holiday")
+            return False
+            
+    return True
+
 def calculate_charges(buy_val, sell_val):
-    stamp = 0.00015 * buy_val            # Stamp Duty on Buy (0.015%)
-    stt = 0.001 * sell_val               # STT on Sell (0.1%)
-    exch = 0.0000345 * (buy_val + sell_val)  # Exchange Transaction Charges (0.00345%)
-    sebi = 0.000001 * (buy_val + sell_val)   # SEBI Charges (0.0001%)
-    gst = 0.18 * (exch + sebi)           # GST (18% on exchange + SEBI)
-    dp = 15.93                           # DP Charges fixed per sell
-    return stamp + stt + exch + sebi + gst + dp
+    stamp = 0.00015 * buy_val
+    stt = 0.001 * (sell_val + buy_val)
+    exch = 0.0000345 * (buy_val + sell_val)
+    sebi = 0.000001 * (buy_val + sell_val)
+    gst = 0.18 * (exch + sebi)
+    dp = 14.75
+    return stamp + stt + dp + gst + exch + sebi
 
-
-def fetch_daily_candles(smart, token, start_date, end_date):
+def fetch_intraday_candles(instrument_key, start_date, end_date):
     os.makedirs(CACHE_DIR, exist_ok=True)
+    key_safe = instrument_key.replace('|', '_')
     cache_file = os.path.join(
         CACHE_DIR,
-        f"{token}_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.pkl"
+        f"{key_safe}_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.pkl"
     )
-
+    
+    # Check cache first
     if os.path.exists(cache_file):
         mod_time = datetime.datetime.fromtimestamp(os.path.getmtime(cache_file))
         if (datetime.datetime.now() - mod_time).days < CACHE_MAX_AGE_DAYS:
             df = pd.read_pickle(cache_file)
-            print("Cache loaded")
-            if hasattr(df.index, 'tz') and df.index.tz is not None:
-                df.index = df.index.tz_convert(None)
-            return df
+            if not df.empty:
+                logger.info(f"Using cached data for {instrument_key}")
+                return df
 
-    span = (end_date - start_date).days
-    if span > 30:
-        parts = []
-        d = start_date
-        while d <= end_date:
-            chunk_end = min(d + timedelta(days=30), end_date)
-            part = fetch_daily_candles(smart, token, d, chunk_end)
-            if not part.empty:
-                parts.append(part)
-            d = chunk_end + timedelta(days=1)
-        if parts:
-            df = pd.concat(parts)
-            df.index = pd.to_datetime(df.index)
-            df.index = df.index.tz_localize(None)
-            df = df.sort_index()
-            df.to_pickle(cache_file)
-            return df
+    # The Upstox API returns data in {'candles': [...]} format
+    all_data = []
+    current_date = start_date.date()
+    end_date = end_date.date()
+    
+    while current_date <= end_date:
+        if not is_market_open(current_date):
+            current_date += timedelta(days=1)
+            continue
+            
+        date_str = current_date.strftime('%Y-%m-%d')
+        url = f"https://api.upstox.com/v3/historical-candle/{instrument_key}/minutes/{INTRADAY_INTERVAL}/{date_str}/{date_str}"
+        
+        logger.info(f"Fetching {instrument_key} for {date_str}")
+        
+        for attempt in range(3):
+            try:
+                resp = requests.get(url, headers={'Accept': 'application/json'})
+                resp.raise_for_status()
+                data = resp.json()
+                
+                if not data or 'data' not in data or 'candles' not in data['data']:
+                    logger.debug(f"No candle data for {instrument_key} on {date_str}")
+                    break
+                
+                candles = data['data']['candles']
+                df_day = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'other'])
+                df_day = df_day.drop(columns=['other'])
+                df_day['timestamp'] = pd.to_datetime(df_day['timestamp'])
+                df_day.set_index('timestamp', inplace=True)
+                df_day.index = df_day.index.tz_localize(None)
+                df_day = df_day.between_time(MARKET_START_TIME, MARKET_END_TIME)
+                
+                if not df_day.empty:
+                    all_data.append(df_day)
+                
+                time.sleep(0.5)  # Rate limiting
+                break
+                
+            except Exception as e:
+                wait = 2 ** attempt
+                logger.warning(f"Attempt {attempt+1} failed for {date_str}: {str(e)}")
+                if attempt == 2:
+                    logger.error(f"Failed to fetch {instrument_key} for {date_str}")
+                time.sleep(wait)
+        
+        current_date += timedelta(days=1)
+
+    if not all_data:
+        logger.warning(f"No data found for {instrument_key} between {start_date} and {end_date}")
         return pd.DataFrame()
 
-    params = {
-        'exchange': 'NSE',
-        'symboltoken': token,
-        'interval': DAILY_INTERVAL,
-        'fromdate': start_date.strftime('%Y-%m-%d 00:00'),
-        'todate': end_date.strftime('%Y-%m-%d 23:59')
-    }
-    for attempt in range(5):
-        try:
-            resp = smart.getCandleData(params)
-            data = resp.get('data') or []
-            print("Fetched")
-            break
-        except Exception as e:
-            wait = 2 ** attempt
-            logger.warning(f"Fetch error for {token} (attempt {attempt+1}), retrying in {wait}s: {e}")
-            time.sleep(wait)
-    else:
-        logger.error(f"Failed to fetch data for {token}")
-        return pd.DataFrame()
-
-    df = pd.DataFrame(data, columns=['timestamp','open','high','low','close','volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    df.set_index('timestamp', inplace=True)
-    df.index = df.index.tz_localize(None)
+    df = pd.concat(all_data).sort_index()
+    df = df[~df.index.duplicated(keep='first')]
     df.to_pickle(cache_file)
-    time.sleep(0.2)
+    logger.info(f"Cached {len(df)} candles for {instrument_key}")
     return df
 
-
 def compute_atr(df, period=ATR_PERIOD):
+    if len(df) < period:
+        return pd.Series(np.nan, index=df.index)
+        
     high, low, close = df['high'], df['low'], df['close']
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs()
-    ], axis=1).max(axis=1)
+    tr1 = high - low
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
+def generate_trading_timestamps(start_date, end_date):
+    """Generate 10-minute timestamps for trading days between start_date and end_date"""
+    timestamps = []
+    current_date = start_date
+    
+    while current_date <= end_date:
+        if not is_market_open(current_date):
+            current_date += timedelta(days=1)
+            continue
+            
+        current_time = datetime.datetime.combine(current_date, MARKET_START_TIME)
+        end_time = datetime.datetime.combine(current_date, MARKET_END_TIME)
+        
+        while current_time <= end_time:
+            timestamps.append(current_time)
+            current_time += timedelta(minutes=INTRADAY_INTERVAL)
+            
+        current_date += timedelta(days=1)
+        
+    return timestamps
 
 def main():
-    smart = init_smartapi()
-    raw = pd.read_csv(BREAKOUT_CSV, dtype=str)
-    raw['time'] = raw.get('time', '09:15:00')
-    raw['date'] = pd.to_datetime(raw['date'], dayfirst=True).dt.date
-    raw['datetime'] = pd.to_datetime(raw['date'].astype(str) + ' ' + raw['time'])
+    # Load and preprocess data
+    raw = pd.read_csv(BREAKOUT_CSV)
+    raw.columns = [c.lower() for c in raw.columns]
+    
+    # Remove -EQ suffix from symbols
+    raw['symbol'] = raw['symbol'].str.replace('-EQ', '').str.strip()
+    
+    # Handle datetime columns
+    if 'datetime' in raw.columns:
+        raw['datetime'] = pd.to_datetime(raw['datetime'])
+    elif 'date' in raw.columns and 'time' in raw.columns:
+        raw['datetime'] = pd.to_datetime(raw['date'] + ' ' + raw['time'])
+    elif 'date' in raw.columns:
+        raw['datetime'] = pd.to_datetime(raw['date']) + pd.Timedelta(hours=9, minutes=15)
+    else:
+        raise ValueError("CSV must contain either 'datetime' column or 'date' column")
+    
+    raw['token'] = raw['token'].astype(int)
     raw = raw.sort_values('datetime')
 
-    start_date = raw['date'].min() - timedelta(days=ATR_PERIOD+5)
-    last_signal = raw['date'].max() + timedelta(days=MAX_HOLD_DAYS)
+    # Merge with symbols data
+    symbols = pd.read_csv(SYMBOLS_CSV)
+    symbols.columns = [c.lower() for c in symbols.columns]
+    symbols['exchange_token'] = symbols['exchange_token'].astype(int)
+    raw = raw.merge(
+        symbols[['instrument_key', 'exchange_token']],
+        left_on='token', 
+        right_on='exchange_token', 
+        how='left'
+    )
 
-    history = {}
-    for tok in raw['token'].unique():
-        df = fetch_daily_candles(smart, tok, start_date, last_signal)
-        if df.empty:
-            continue
-        df['ATR'] = compute_atr(df)
-        history[tok] = df
-
-    trades_by_date = raw.groupby('date')
+    # Prepare timeline
+    first_signal = raw['datetime'].min().to_pydatetime()
+    last_signal = raw['datetime'].max().to_pydatetime()
+    end_date = last_signal + timedelta(days=MAX_HOLD_DAYS + 1)
+    timestamps = generate_trading_timestamps(first_signal.date(), end_date.date())
+    
+    # Initialize trading variables
     total_capital = TOTAL_CAPITAL_START
-    ongoing = {}
+    ongoing_positions = {}
     results = []
-    current = raw['date'].min()
+    cached_data = {}
+    
+    logger.info(f"Starting backtest from {first_signal} to {end_date}")
+    logger.info(f"Total timestamps to process: {len(timestamps)}")
+    logger.info(f"Initial capital: {total_capital}")
 
-    while current <= last_signal:
-        # EXIT logic
-        for sym, pos in list(ongoing.items()):
-            df_hist = history.get(pos['token'])
-            if df_hist is None or current not in df_hist.index.date:
+    # Main processing loop
+    for idx, current_ts in enumerate(timestamps):
+        if idx % 100 == 0:
+            logger.info(f"Processing {idx+1}/{len(timestamps)}: {current_ts}")
+        
+        # EXIT LOGIC
+        for symbol, pos in list(ongoing_positions.items()):
+            df = cached_data.get(pos['instrument_key'])
+            if df is None:
+                logger.warning(f"No data cached for {symbol}")
                 continue
-            row = df_hist.loc[df_hist.index.date == current].iloc[0]
-            high, low, close, atr = row['high'], row['low'], row['close'], row['ATR']
-            pos['days_held'] += 1
-            pos['highest'] = max(pos.get('highest', pos['breakout']), high)
-            pos['trail_stop'] = pos['highest'] - ATR_MULTIPLIER * atr
-
-            exit_flag = False
-            if low <= pos['sl']:
-                price, reason = pos['sl'], 'SL'; exit_flag = True
-            elif pos['days_held'] <= FORCE_EXIT_DAYS and low <= pos['breakout']:
-                price, reason = pos['breakout'], 'QUALITY_EXIT'; exit_flag = True
-            elif pos['hit1'] and not pos['hit2'] and low <= pos['breakout']:
-                price, reason = pos['breakout'], 'T1_SL'; exit_flag = True
-            elif pos['hit2'] and low <= pos['targets'][0]:
-                price, reason = pos['targets'][0], 'T2_SL'; exit_flag = True
-            elif low <= pos['trail_stop']:
-                price, reason = pos['trail_stop'], 'ATR_TRAIL'; exit_flag = True
-            elif high >= pos['targets'][2]:
-                price, reason = pos['targets'][2], 'T3'; exit_flag = True
-            elif pos['days_held'] >= FORCE_EXIT_DAYS and not (pos['hit1'] or pos['hit2']):
-                price, reason = close, 'FORCE_EXIT'; exit_flag = True
-            elif pos['days_held'] > MAX_HOLD_DAYS:
-                price, reason = close, 'TIME_STOP'; exit_flag = True
-
-            if exit_flag:
-                buy_val = pos['breakout'] * pos['size']
-                sell_val = price * pos['size']
+                
+            try:
+                current_bar = df.loc[current_ts]
+            except KeyError:
+                try:
+                    current_bar = df.iloc[df.index.get_indexer([current_ts], method='nearest')[0]]
+                except:
+                    logger.warning(f"No price data for {symbol} at {current_ts}")
+                    continue
+            
+            high = current_bar['high']
+            low = current_bar['low']
+            close = current_bar['close']
+            ongoing_positions[symbol]['current_price'] = close
+            
+            # Calculate trading days held (excluding weekends/holidays)
+            hold_days = len(pd.bdate_range(pos['entry_date'], current_ts.date()))
+            
+            exit_reason = None
+            exit_price = None
+            
+            # Target 1 hit
+            if not pos['hit1'] and high >= pos['targets'][0]:
+                ongoing_positions[symbol]['hit1'] = True
+                ongoing_positions[symbol]['stop_loss'] = pos['buyprice'] + (pos['buyprice'] - pos['initial_sl'])
+                logger.info(f"{symbol} hit T1 at {pos['targets'][0]}, new SL: {ongoing_positions[symbol]['stop_loss']}")
+            
+            # Target 2 hit
+            if pos['hit1'] and not pos['hit2'] and high >= pos['targets'][1]:
+                ongoing_positions[symbol]['hit2'] = True
+                ongoing_positions[symbol]['stop_loss'] += (pos['targets'][1] - pos['targets'][0])
+                logger.info(f"{symbol} hit T2 at {pos['targets'][1]}, new SL: {ongoing_positions[symbol]['stop_loss']}")
+            
+            # Exit conditions
+            if high >= pos['targets'][2]:
+                exit_reason = 'T3'
+                exit_price = pos['targets'][2]
+            elif low <= pos['stop_loss']:
+                exit_reason = 'SL'
+                if low >= pos['targets'][0]:
+                    exit_reason = 'T1_SL'
+                if low >= pos['targets'][1]:
+                    exit_reason = 'T2_SL'
+                exit_price = pos['stop_loss']
+            elif hold_days >= FORCE_EXIT_DAYS and not (pos['hit1'] or pos['hit2']):
+                exit_reason = 'FORCE_EXIT'
+                exit_price = close
+            elif hold_days > MAX_HOLD_DAYS:
+                exit_reason = 'TIME_STOP'
+                exit_price = close
+            
+            if exit_reason:
+                buy_val = pos['buyprice'] * pos['size']
+                sell_val = exit_price * pos['size']
                 charges = calculate_charges(buy_val, sell_val)
-                pnl = (price - pos['breakout']) * pos['size']
+                pnl = (exit_price - pos['buyprice']) * pos['size'] - charges
+                
                 total_capital += pos['capital'] + pnl
-                print("EXIT--")
-                results.append({**pos,
-                                'exit_date': current.strftime('%Y-%m-%d'),
-                                'exit_price': price,
-                                'result': reason,
-                                'pnl_total': pnl,
-                                'charges': round(charges,2),
-                                'remaining_capital': total_capital})
-                del ongoing[sym]
-
-        # ENTRY logic
-        if current in trades_by_date.groups:
-            for _, row in trades_by_date.get_group(current).iterrows():
-                sym, tok = row['symbol'], row['token']
-                breakout = float(row['breakout_level'])
-                df_hist = history.get(tok)
-                if df_hist is None or current not in df_hist.index.date:
+                
+                trade_result = {
+                    'symbol': symbol,
+                    'entry_date': pos['entry_date'].strftime('%Y-%m-%d'),
+                    'entry_time': pos['entry_time'].strftime('%H:%M'),
+                    'exit_date': current_ts.strftime('%Y-%m-%d'),
+                    'exit_time': current_ts.strftime('%H:%M'),
+                    'buyprice': pos['buyprice'],
+                    'exit_price': exit_price,
+                    'size': pos['size'],
+                    'stop_loss': pos['stop_loss'],
+                    'target1': pos['targets'][0],
+                    'target2': pos['targets'][1],
+                    'target3': pos['targets'][2],
+                    'result': exit_reason,
+                    'pnl_total': pnl,
+                    'charges': round(charges, 2),
+                    'remaining_capital': total_capital,
+                    'days_held': hold_days
+                }
+                results.append(trade_result)
+                logger.info(f"EXITED {symbol} at {exit_price} ({exit_reason}), P&L: {pnl:.2f}")
+                del ongoing_positions[symbol]
+        
+      # ENTRY LOGIC
+        signal_start = current_ts - timedelta(minutes=10)
+        signal_end = current_ts  # Current timestamp
+        signals = raw[
+            (raw['datetime'] > signal_start) & 
+            (raw['datetime'] <= signal_end)
+        ]
+        
+        for _, row in signals.iterrows():
+            print("hi")
+            symbol = row['symbol']
+            inst_key = row['instrument_key']
+            
+            if symbol in ongoing_positions:
+                logger.debug(f"Skipping {symbol} - already in portfolio")
+                continue
+                
+            if inst_key not in cached_data:
+                logger.info(f"Fetching data for {symbol} ({inst_key})")
+                start_fetch = current_ts - timedelta(days=20)
+                end_fetch = current_ts + timedelta(days=10)
+                df = fetch_intraday_candles(inst_key, start_fetch, end_fetch)
+                
+                if df.empty:
+                    logger.warning(f"No data found for {symbol} ({inst_key})")
                     continue
-                atr = df_hist.loc[df_hist.index.date == current, 'ATR'].iloc[0]
-                if np.isnan(atr) or atr <= 0:
+                    
+                print("fetched")
+                cached_data[inst_key] = df
+            
+            df = cached_data[inst_key]
+            
+            # Verify sufficient future data exists (10 days)
+            future_data_points = len(df[df.index >= current_ts])
+            if future_data_points < 38:  # ~3.8 candles per day * 10 days
+                logger.warning(f"Insufficient future data for {symbol} (only {future_data_points} points)")
+                continue
+            
+            try:
+                current_bar = df[df.index >= row['datetime']].iloc[0]
+                if (current_bar.name - row['datetime']) > timedelta(minutes=MAX_DATA_STALENESS_MINUTES):
+                    logger.warning(f"Price data too stale for {symbol}")
                     continue
-                risk_amount = min(RISK_PER_TRADE_PCT * total_capital, MAX_CAPITAL_PER_TRADE)
-                size = int(np.floor(risk_amount / (atr * ATR_MULTIPLIER)))
-                if size < 1:
-                    continue
-                cap_used = size * breakout
-                if cap_used > MAX_CAPITAL_PER_TRADE:
-                    size = MAX_CAPITAL_PER_TRADE // breakout
-                    cap_used = size * breakout
+                    
+                current_price = current_bar['close']
+            except IndexError:
+                logger.warning(f"No price data available for {symbol} after {row['datetime']}")
+                continue
+            
+            # Calculate position size with proper capital constraints
+            atr_series = compute_atr(df.tail(100))
+            if atr_series.empty or atr_series.isna().all():
+                logger.warning(f"Invalid ATR for {symbol}")
+                continue
+                
+            atr = atr_series.iloc[-1]
+            risk_amount = min(RISK_PER_TRADE_PCT * total_capital, MAX_CAPITAL_PER_TRADE)
+            
+            # Calculate max shares within capital limits
+            max_shares_by_risk = max(1, int(risk_amount / (atr * 1.5)))
+            max_shares_by_capital = min(MAX_CAPITAL_PER_TRADE // current_price, 
+                                      total_capital // current_price)
+            
+            position_size = min(max_shares_by_risk, max_shares_by_capital)
+            if position_size < 1:
+                logger.info(f"Position size too small for {symbol} at {current_price}")
+                continue
+                
+            trade_cost = current_price * position_size
+            if trade_cost > total_capital:
+                logger.info(f"Insufficient capital for {symbol} (needed: {trade_cost:.2f}, available: {total_capital:.2f})")
+                continue
+                
+            # Execute trade
+            total_capital -= trade_cost
+            ongoing_positions[symbol] = {
+                'symbol': symbol,
+                'instrument_key': inst_key,
+                'entry_date': current_ts.date(),
+                'entry_time': current_ts.time(),
+                'buyprice': current_price,
+                'initial_sl': row['stop_loss'],
+                'stop_loss': row['stop_loss'],
+                'targets': (row['target1'], row['target2'], row['target3']),
+                'size': position_size,
+                'capital': trade_cost,
+                'hit1': False,
+                'hit2': False,
+                'current_price': current_price
+            }
+            
+            logger.info(f"ENTERED {symbol} at {current_price:.2f} for {position_size} shares")
+            logger.info(f"Remaining capital: {total_capital:.2f}")
 
-                if sym in ongoing:
-                    old = ongoing.pop(sym)
-                    open_price = df_hist.loc[df_hist.index.date == current, 'open'].iloc[0]
-                    buy_val_old = old['breakout'] * old['size']
-                    sell_val_old = open_price * old['size']
-                    charges_old = 0
-                    pnl = (open_price - old['breakout']) * old['size']
-                    total_capital += old['capital'] + pnl
-                    results.append({**old,
-                                    'exit_date': current.strftime('%Y-%m-%d'),
-                                    'exit_price': open_price,
-                                    'result': 'REPLACE',
-                                    'pnl_total': pnl,
-                                    'charges': round(charges_old,2),
-                                    'remaining_capital': total_capital})
-                if total_capital >= cap_used:
-                    total_capital -= cap_used
-                    print("-----BUY")
-                    ongoing[sym] = {
-                        'symbol': sym,
-                        'entry_date': current.strftime('%Y-%m-%d'),
-                        'breakout': breakout,
-                        'sl': float(row['stop_loss']),
-                        'targets': (
-                            float(row['target1']),
-                            float(row['target2']),
-                            float(row['target3'])
-                        ),
-                        'token': tok,
-                        'size': size,
-                        'capital': cap_used,
-                        'hit1': False,
-                        'hit2': False,
-                        'days_held': 0
-                    }
-        current += timedelta(days=1)
-
-    # Final exit of open positions
-    last_date = last_signal
-    for sym, pos in ongoing.items():
-        df_hist = history.get(pos['token'], pd.DataFrame())
-        if not df_hist.empty and last_date in df_hist.index.date:
-            close_price = df_hist.loc[df_hist.index.date == last_date, 'close'].iloc[0]
+    # Final cleanup for positions still open
+    for symbol, pos in ongoing_positions.items():
+        df = cached_data.get(pos['instrument_key'])
+        if df is not None and not df.empty:
+            last_price = df['close'].iloc[-1]
         else:
-            close_price = pos['breakout']
-        buy_val = pos['breakout'] * pos['size']
-        sell_val = close_price * pos['size']
+            last_price = pos['buyprice']
+            
+        hold_days = len(pd.bdate_range(pos['entry_date'], timestamps[-1].date()))
+        buy_val = pos['buyprice'] * pos['size']
+        sell_val = last_price * pos['size']
         charges = calculate_charges(buy_val, sell_val)
-        pnl = (close_price - pos['breakout']) * pos['size']
-        total_capital += pos['capital'] + pnl
-        results.append({**pos,
-                        'exit_date': last_date.strftime('%Y-%m-%d'),
-                        'exit_price': close_price,
-                        'result': 'END',
-                        'pnl_total': pnl,
-                        'charges': round(charges,2),
-                        'remaining_capital': total_capital})
-        print("EXIT--")
+        pnl = (last_price - pos['buyprice']) * pos['size'] - charges
+        
+        trade_result = {
+            'symbol': symbol,
+            'entry_date': pos['entry_date'].strftime('%Y-%m-%d'),
+            'entry_time': pos['entry_time'].strftime('%H:%M'),
+            'exit_date': timestamps[-1].strftime('%Y-%m-%d'),
+            'exit_time': timestamps[-1].strftime('%H:%M'),
+            'buyprice': pos['buyprice'],
+            'exit_price': last_price,
+            'size': pos['size'],
+            'stop_loss': pos['stop_loss'],
+            'target1': pos['targets'][0],
+            'target2': pos['targets'][1],
+            'target3': pos['targets'][2],
+            'result': 'END',
+            'pnl_total': pnl,
+            'charges': round(charges, 2),
+            'remaining_capital': total_capital,
+            'days_held': hold_days
+        }
+        results.append(trade_result)
+        logger.info(f"CLOSED {symbol} at end, price: {last_price:.2f}, P&L: {pnl:.2f}")
+    
+    # Save results
+# Save results
+# Save results
+    if results:
+        df_res = pd.DataFrame(results)
+        
+        # Calculate summary statistics
+        total_pnl = df_res['pnl_total'].sum()
+        total_charges = df_res['charges'].sum()
+        net_profit = total_pnl - total_charges
+        final_capital = TOTAL_CAPITAL_START + net_profit
+        winning_trades = len(df_res[df_res['pnl_total'] > 0])
+        win_rate = winning_trades / len(results) * 100
+        avg_hold_days = df_res['days_held'].mean()
+        
+        # Calculate exit type counts
+        exit_counts = df_res['result'].value_counts().to_dict()
+        exit_types = {
+            'SL': exit_counts.get('SL', 0),
+            'FORCE_EXIT': exit_counts.get('FORCE_EXIT', 0),
+            'TIME_STOP': exit_counts.get('TIME_STOP', 0),
+            'T1': exit_counts.get('T1', 0),
+            'T2': exit_counts.get('T2', 0),
+            'T3': exit_counts.get('T3', 0),
+            'T1_SL': exit_counts.get('T1_SL', 0),
+            'T2_SL': exit_counts.get('T2_SL', 0),
+        }
+        
+        logger.info(f"\n=== BACKTEST COMPLETE ===")
+        logger.info(f"Initial capital: {TOTAL_CAPITAL_START}")
+        logger.info(f"Final capital: {final_capital:.2f}")
+        logger.info(f"Gross P&L: {total_pnl:.2f}")
+        logger.info(f"Total Charges: {total_charges:.2f}")
+        logger.info(f"Net Profit: {net_profit:.2f}")
+        logger.info(f"Number of trades: {len(results)}")
+        
+        # Print detailed final summary
+        print("\n=== FINAL SUMMARY ===")
+        print(f"Starting Capital: ₹{TOTAL_CAPITAL_START:,.2f}")
+        print(f"Final Capital: ₹{final_capital:,.2f}")
+        print(f"Gross P&L: ₹{total_pnl:,.2f}")
+        print(f"Total Charges: ₹{total_charges:,.2f}")
+        print(f"Net Profit: ₹{net_profit:,.2f}")
 
-        if results:
-            df_results = pd.DataFrame(results)
+        print(f"\n=== TRADE STATISTICS ===")
+        print(f"Total Trades: {len(results)}")
+        print(f"Winning Trades: {winning_trades} ({win_rate:.1f}%)")
+        print(f"Average Holding Days: {avg_hold_days:.1f}")
 
-            # Calculate total pnl and total charges
-            total_pnl = df_results['pnl_total'].sum()
-            total_charges = df_results['charges'].sum()
-
-            # Append a summary row at the end
-            summary_row = {col: '' for col in df_results.columns}
-            summary_row['result'] = 'TOTAL'
-            summary_row['pnl_total'] = total_pnl
-            summary_row['charges'] = round(total_charges, 2)
-            df_results = pd.concat([df_results, pd.DataFrame([summary_row])], ignore_index=True)
-
-            # Save to CSV
-            df_results.to_csv(SWING_BACKTEST_CSV, index=False)
-            print(f"Backtest complete, results saved to {SWING_BACKTEST_CSV}")
-            print(f"\n==== SUMMARY ====")
-            print(f"Total PnL     : ₹{round(total_pnl, 2)}")
-            print(f"Total Charges : ₹{round(total_charges, 2)}\n")
-            print(f"Net Profit : ₹{round(total_pnl, 2) - round(total_charges, 2)}\n")
-        else:
-            logger.warning("No backtest results to save")
-
+        print("\n=== EXIT TYPE COUNTS ===")
+        print(f"SL: {exit_types['SL']}")
+        print(f"Force Exits (after {FORCE_EXIT_DAYS} days): {exit_types['FORCE_EXIT']}")
+        print(f"Last Day Exits: {exit_types['TIME_STOP']}")
+        print(f"T1: {exit_types['T1']}")
+        print(f"T2: {exit_types['T2']}")
+        print(f"T3: {exit_types['T3']}")
+        print(f"SL After T1: {exit_types['T1_SL']}")
+        print(f"SL After T2: {exit_types['T2_SL']}")
+        
+        # Save to CSV (without exit counts)
+        df_res.to_csv(SWING_BACKTEST_CSV, index=False)
+        
+    else:
+        logger.warning("No trades executed during backtest period")
 
 if __name__ == '__main__':
     main()
